@@ -14,7 +14,7 @@
  * ---------------------------------------------------------------------
 
  *
- * Author: Martin Kronbichler, 2020
+ * Author: Jiaqi Zhang, 2020
  */
 
 #include <deal.II/base/conditional_ostream.h>
@@ -58,15 +58,12 @@ namespace LevelsetMatrixfree
   using namespace dealii;
 
   constexpr unsigned int dimension            = 2;
-  constexpr unsigned int n_global_refinements = 6;
+  constexpr unsigned int n_global_refinements = 7;
   constexpr unsigned int fe_degree            = 3;
   constexpr unsigned int vel_degree           = 2;
   constexpr unsigned int n_q_points_1d        = fe_degree + 2;
 
   using Number = double;
-
-  constexpr double final_time  = 2.0;
-  constexpr double output_tick = 0.05;
 
   const double courant_number = 0.05;
   enum LevelsetRungeKuttaScheme
@@ -74,7 +71,7 @@ namespace LevelsetMatrixfree
     stage_3_order_3, 
     stage_2_order_2, 
   };
-  constexpr LevelsetRungeKuttaScheme lsrk_scheme = stage_2_order_2;
+  constexpr LevelsetRungeKuttaScheme lsrk_scheme = stage_3_order_3;
 
   enum EulerNumericalFlux
   {
@@ -315,7 +312,6 @@ template <int dim, int degree, int velocity_degree, int n_points_1d>
     double compute_cell_convective_speed(const LinearAlgebra::distributed::Vector<Number> &velocity_solution);
 
     void apply_forward_euler(
-      const double current_time,
       const double time_step,
       const std::vector<LinearAlgebra::distributed::Vector<Number> *> &src,
       LinearAlgebra::distributed::Vector<Number> &dst) const;
@@ -683,7 +679,6 @@ template <int dim, int degree, int velocity_degree, int n_points_1d>
 
   template <int dim, int degree, int velocity_degree, int n_points_1d>
   void LevelsetOperator<dim, degree, velocity_degree, n_points_1d>::apply_forward_euler(
-    const double /*current_time*/,
     const double time_step,
     const std::vector<LinearAlgebra::distributed::Vector<Number> *> &src,
     LinearAlgebra::distributed::Vector<Number> &                     dst) const
@@ -974,96 +969,75 @@ void LevelsetProblem<dim>::run()
     levelset_operator.compute_maximal_speed(velocity_solution);
   pcout << "max speed is" << max_speed << std::endl;
 
-  double time_step    = 0.0008;
   double current_time = 0.;
 
   std::vector<LinearAlgebra::distributed::Vector<Number> *> old_sol_and_vel(
     {&levelset_old_solution, &velocity_solution});
 
-  //setup TVB3 coefficient:
-  // const double a_rk[] = {0.0, 3.0 / 4.0, 1.0 / 3.0};
-  // const double b_rk[] = {1.0, 1.0 / 4.0, 2.0 / 3.0};
-  // const unsigned int n_stages = 3;
   LinearAlgebra::distributed::Vector<Number> rk_register;
   rk_register.reinit(levelset_solution);
 
   std::vector<LinearAlgebra::distributed::Vector<Number> *> ui_and_vel(
       {&rk_register, &velocity_solution});
 
-  levelset_operator.get_lambda(max_speed);
   double old_time_step = time_step;
-
-  std::cout<<"hmin = "<<GridTools::minimal_cell_diameter(triangulation) /std::sqrt (1.*dim)
-  <<" max_speed/h = "<<std::sqrt (1.*dim)/max_speed/GridTools::minimal_cell_diameter(triangulation)
-  <<" max convective speed = "<<levelset_operator.compute_cell_convective_speed(velocity_solution)
-  <<std::endl;
 
   const LevelsetTimeIntegrator time_integrator(lsrk_scheme);
 
-  for (int step = 0; step < 1000; ++step)
+  const unsigned int total_steps = 2000;
+
+  for (int unsigned step = 0; step < total_steps; ++step)
     {
       //compute time step
       time_step = courant_number/levelset_operator.compute_cell_convective_speed(velocity_solution);
-#if 0
       {
-        //evolve one time step
-        for (unsigned int stage = 0; stage < n_stages; ++stage)
+        TimerOutput::Scope t(timer, "rk time stepping total");
+        if (step == 0)
         {
-          rk_register.swap(levelset_solution);
-
-          if (stage == 1) //n+1
-          {
-            const double factor = time_step / old_time_step;
-            velocity_solution.equ(1. + factor, velocity_old_solution);
-            velocity_solution.add(-factor, velocity_old_old_solution);
-          }
-          else if (stage == 2) //n+1/2
-          {
-            velocity_solution.sadd(0.5, 0.5, velocity_old_solution);
-          }
-
-          // levelset_operator.update_global_lambda(velocity_solution);
-          levelset_operator.perform_stage(time_step,
-                                          b_rk[stage],
-                                          a_rk[stage],
-                                          levelset_old_solution,
-                                          ui_and_vel,
-                                          levelset_solution);
+          //velocity cannot be extrapolated, so use forward euler (with small tiem step)
+          rk_register = levelset_old_solution;
+          levelset_operator.apply_forward_euler(time_step,
+                                                ui_and_vel,
+                                                levelset_solution);
         }
+        else
+        {
+          //reverse the velocity
+          if (step == total_steps / 2)
+          {
+            velocity_solution *= -1.;
+            velocity_old_solution *= -1.;
+            velocity_old_old_solution *= -1.;
+          }
+          time_integrator.perform_time_step(levelset_operator,
+                                            old_time_step,
+                                            time_step,
+                                            velocity_old_solution,
+                                            velocity_old_old_solution,
+                                            ui_and_vel,
+                                            levelset_old_solution,
+                                            levelset_solution);
+        }
+        levelset_old_solution = levelset_solution;
+        old_time_step = time_step;
       }
-#else
-      time_integrator.perform_time_step(levelset_operator,
-                                        old_time_step,
-                                        time_step,
-                                        velocity_old_solution,
-                                        velocity_old_old_solution,
-                                        ui_and_vel,
-                                        levelset_old_solution,
-                                        levelset_solution);
-#endif
-      levelset_old_solution = levelset_solution;
-      old_time_step = time_step;
 
-      pcout << " step " << step << " done! "
-            << " time is " << current_time 
-            << " time_step is " << time_step
-            << " sol l2 norm: "<<levelset_solution.l2_norm()
-            << std::endl;
-
-      // pcout << " l2 norm " << levelset_solution.l2_norm()
-      //       << " l1 norm" << levelset_solution.l1_norm()
-      //       << std::endl;
       current_time += time_step;
       if ((step+1) % 100 == 0)
       {
         output_results(step);
+        pcout << " step " << step << " done! "
+              << " time is " << current_time
+              << " time_step is " << time_step
+              << " sol l2 norm: " << levelset_solution.l2_norm()
+              << std::endl;
       }
     }
   timer.print_wall_time_statistics(MPI_COMM_WORLD);
   pcout << std::endl;
 }
 
-  } // namespace Euler_DG
+} // namespace LevelsetMatrixfree
 
 int main(int argc, char **argv)
 {
