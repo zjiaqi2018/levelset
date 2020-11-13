@@ -58,7 +58,7 @@ namespace LevelsetMatrixfree
   using namespace dealii;
 
   constexpr unsigned int dimension            = 2;
-  constexpr unsigned int n_global_refinements = 7;
+  constexpr unsigned int n_global_refinements = 6;
   constexpr unsigned int fe_degree            = 3;
   constexpr unsigned int vel_degree           = 2;
   constexpr unsigned int n_q_points_1d        = fe_degree + 2;
@@ -72,15 +72,6 @@ namespace LevelsetMatrixfree
     stage_2_order_2,
   };
   constexpr LevelsetRungeKuttaScheme lsrk_scheme = stage_3_order_3;
-
-  enum EulerNumericalFlux
-  {
-    lax_friedrichs_modified,
-    harten_lax_vanleer,
-  };
-  constexpr EulerNumericalFlux numerical_flux_type = lax_friedrichs_modified;
-
-
 
   class LevelsetTimeIntegrator
   {
@@ -296,13 +287,11 @@ namespace LevelsetMatrixfree
   class LevelsetOperator
   {
   public:
-    static constexpr unsigned int n_quadrature_points_1d = n_points_1d;
-
     LevelsetOperator(TimerOutput &timer_output);
 
     void
     reinit(const Mapping<dim> &                                 mapping,
-           const std::vector<const DoFHandler<dim> *>           dof_handlers,
+           const std::vector<const DoFHandler<dim> *>          &dof_handlers,
            const std::vector<const AffineConstraints<double> *> constraints,
            const std::vector<Quadrature<1>>                     quadratures);
 
@@ -335,21 +324,6 @@ namespace LevelsetMatrixfree
           const std::vector<LinearAlgebra::distributed::Vector<Number> *> &src,
           LinearAlgebra::distributed::Vector<Number> &dst) const;
 
-    void perform_stage(
-      const LinearAlgebra::distributed::Vector<double> &old_levelset_solution,
-      const LinearAlgebra::distributed::Vector<double> &velocity,
-      LinearAlgebra::distributed::Vector<double> &      levelset_solution);
-
-    void
-    perform_stage(const Number cur_time,
-                  const Number factor_solution,
-                  const Number factor_ai,
-                  const LinearAlgebra::distributed::Vector<Number> &current_ri,
-                  LinearAlgebra::distributed::Vector<Number> &      vec_ki,
-                  LinearAlgebra::distributed::Vector<Number> &      solution,
-                  LinearAlgebra::distributed::Vector<Number> &next_ri) const;
-
-
     double compute_maximal_speed(
       const LinearAlgebra::distributed::Vector<Number> &solution) const;
 
@@ -358,14 +332,7 @@ namespace LevelsetMatrixfree
     MatrixFree<dim, Number> data;
 
     TimerOutput &timer;
-
-    std::map<types::boundary_id, std::unique_ptr<Function<dim>>>
-      inflow_boundaries;
-    std::map<types::boundary_id, std::unique_ptr<Function<dim>>>
-                                   subsonic_outflow_boundaries;
-    std::set<types::boundary_id>   wall_boundaries;
-    std::unique_ptr<Function<dim>> body_force;
-
+    
     VectorizedArray<Number> lambda;
 
     void local_apply_inverse_mass_matrix(
@@ -422,7 +389,7 @@ namespace LevelsetMatrixfree
     compute_cell_convective_speed(
       const LinearAlgebra::distributed::Vector<Number> &velocity_solution)
   {
-    TimerOutput::Scope t(timer, "compute time step");
+    TimerOutput::Scope t(timer, "compute cell convective speed");
     Number             max_transport = 0; // v/h
     FEEvaluation<dim, velocity_degree, degree + 1, dim, Number> vel_phi(data,
                                                                         1,
@@ -501,7 +468,7 @@ namespace LevelsetMatrixfree
   template <int dim, int degree, int velocity_degree, int n_points_1d>
   void LevelsetOperator<dim, degree, velocity_degree, n_points_1d>::reinit(
     const Mapping<dim> &                                 mapping,
-    const std::vector<const DoFHandler<dim> *>           dof_handlers,
+    const std::vector<const DoFHandler<dim> *>          &dof_handlers,
     const std::vector<const AffineConstraints<double> *> constraints,
     const std::vector<Quadrature<1>>                     quadratures)
   {
@@ -705,8 +672,6 @@ namespace LevelsetMatrixfree
     {
       TimerOutput::Scope t(timer, "apply - integrals");
 
-
-
       data.loop(&LevelsetOperator::local_apply_cell,
                 &LevelsetOperator::local_apply_face,
                 &LevelsetOperator::local_apply_boundary_face,
@@ -821,18 +786,6 @@ namespace LevelsetMatrixfree
                      dst);
     }
     return dst;
-  }
-
-  template <int dim, int degree, int velocity_degree, int n_points_1d>
-  void perform_stage(
-    const std::vector<double> &                       time_steps,
-    const LinearAlgebra::distributed::Vector<double> &old_levelset_solution,
-    const LinearAlgebra::distributed::Vector<double> &velocity,
-    LinearAlgebra::distributed::Vector<double> &      levelset_solution)
-  {
-    // setup TVB3 coefficient:
-    const double a_rk[] = {0.0, 3.0 / 4.0, 1.0 / 3.0};
-    const double b_rk[] = {1.0, 1.0 / 4.0, 2.0 / 3.0};
   }
 
   template <int dim>
@@ -1018,6 +971,13 @@ namespace LevelsetMatrixfree
         time_step =
           courant_number /
           levelset_operator.compute_cell_convective_speed(velocity_solution);
+
+        pcout << " step " << step << " done! "
+              << " cell speed: " << levelset_operator.compute_cell_convective_speed(velocity_solution)
+              << " time is " << current_time << " time_step is "
+              << time_step
+              << " sol l2 norm: " << levelset_solution.l2_norm()
+              << std::endl;
         {
           TimerOutput::Scope t(timer, "rk time stepping total");
           if (step == 0)
