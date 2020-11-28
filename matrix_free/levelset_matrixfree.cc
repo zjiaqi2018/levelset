@@ -1039,7 +1039,7 @@ namespace LevelsetMatrixfree
           //                                   ui_and_vel,
           //                                   levelset_old_solution,
           //                                   levelset_solution);
-#if 1
+#if 0
           const double a_rk[3] = {0.0, 3.0 / 4.0, 1.0 / 3.0};
           const double b_rk[3] = {1.0, 1.0 / 4.0, 2.0 / 3.0};
           for (unsigned int i = 0; i < 3; ++i)
