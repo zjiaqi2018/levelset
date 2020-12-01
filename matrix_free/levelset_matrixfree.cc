@@ -66,91 +66,6 @@ namespace LevelsetMatrixfree
   using Number = double;
 
   const double courant_number = 0.05;
-  enum LevelsetRungeKuttaScheme
-  {
-    stage_3_order_3,
-    stage_2_order_2,
-  };
-  constexpr LevelsetRungeKuttaScheme lsrk_scheme = stage_3_order_3;
-
-  class LevelsetTimeIntegrator
-  {
-  public:
-    LevelsetTimeIntegrator(const LevelsetRungeKuttaScheme scheme)
-    {
-      switch (scheme)
-        {
-          case stage_3_order_3:
-            {
-              bi = {{1.0, 1.0 / 4.0, 2.0 / 3.0}};
-              ai = {{0., 3. / 4., 1. / 3.}};
-
-              break;
-            }
-
-          case stage_2_order_2:
-            {
-              bi = {{1., 1. / 2}};
-              ai = {{0., 1. / 2.}};
-
-              break;
-            }
-
-          default:
-            AssertThrow(false, ExcNotImplemented());
-        }
-    }
-
-    unsigned int n_stages() const
-    {
-      return bi.size();
-    }
-
-    template <typename VectorType, typename Operator>
-    void perform_time_step(const Operator &          levelset_operator,
-                           const double              old_time_step,
-                           const double              time_step,
-                           const VectorType &        velocity_old_solution,
-                           const VectorType &        velocity_old_old_solution,
-                           std::vector<VectorType *> ui_and_velocity,
-                           const VectorType &        levelset_old_solution,
-                           VectorType &              levelset_solution) const
-    {
-      AssertDimension(ai.size(), bi.size());
-      ui_and_velocity[1]->zero_out_ghosts();
-
-      for (unsigned int stage = 0; stage < bi.size(); ++stage)
-        {
-          ui_and_velocity[0]->swap(levelset_solution);
-
-          if (stage == 1) // n+1
-            {
-              const double time_step_factor = time_step / old_time_step;
-              ui_and_velocity[1]->equ(1. + time_step_factor,
-                                      velocity_old_solution);
-              ui_and_velocity[1]->add(-time_step_factor,
-                                      velocity_old_old_solution);
-            }
-          else if (stage == 2) // n+1/2
-            {
-              ui_and_velocity[1]->sadd(0.5, 0.5, velocity_old_solution);
-            }
-          ui_and_velocity[1]->update_ghost_values();
-          levelset_operator.perform_stage(time_step,
-                                          bi[stage],
-                                          ai[stage],
-                                          levelset_old_solution,
-                                          ui_and_velocity,
-                                          levelset_solution);
-        }
-    }
-
-  private:
-    std::vector<double> bi;
-    std::vector<double> ai;
-  };
-
-
   template <int dim>
   class LevelsetVelocity : public Function<dim>
   {
@@ -299,11 +214,6 @@ namespace LevelsetMatrixfree
     void initialize_vector(LinearAlgebra::distributed::Vector<Number> &vector,
                            const unsigned int no_dof = 0) const;
 
-    void get_lambda(const double lambda);
-
-    void update_global_lambda(
-      const LinearAlgebra::distributed::Vector<Number> &velocity_solution);
-
     double compute_cell_convective_speed(
       const LinearAlgebra::distributed::Vector<Number> &velocity_solution);
 
@@ -327,10 +237,6 @@ namespace LevelsetMatrixfree
       const LinearAlgebra::distributed::Vector<Number> levelset_old_solution,
       const std::vector<LinearAlgebra::distributed::Vector<Number> *> &src,
       LinearAlgebra::distributed::Vector<Number> &dst) const;
-
-    double compute_maximal_speed(
-      const LinearAlgebra::distributed::Vector<Number> &solution) const;
-
 
   private:
     MatrixFree<dim, Number> data;
@@ -371,22 +277,6 @@ namespace LevelsetMatrixfree
     TimerOutput &timer)
     : timer(timer)
   {}
-
-  template <int dim, int degree, int velocity_degree, int n_points_1d>
-  void LevelsetOperator<dim, degree, velocity_degree, n_points_1d>::get_lambda(
-    const double lambda)
-  {
-    this->lambda = make_vectorized_array(lambda);
-  }
-
-  template <int dim, int degree, int velocity_degree, int n_points_1d>
-  void LevelsetOperator<dim, degree, velocity_degree, n_points_1d>::
-    update_global_lambda(
-      const LinearAlgebra::distributed::Vector<Number> &velocity_solution)
-  {
-    const double max_speed = compute_maximal_speed(velocity_solution);
-    this->lambda           = make_vectorized_array(max_speed);
-  }
 
   template <int dim, int degree, int velocity_degree, int n_points_1d>
   double LevelsetOperator<dim, degree, velocity_degree, n_points_1d>::
@@ -430,43 +320,6 @@ namespace LevelsetMatrixfree
       }
       max_transport = Utilities::MPI::max(max_transport, MPI_COMM_WORLD);
       return max_transport;
-  }
-
-  template <int dim, int degree, int velocity_degree, int n_points_1d>
-  double LevelsetOperator<dim, degree, velocity_degree, n_points_1d>::
-    compute_maximal_speed(
-      const LinearAlgebra::distributed::Vector<Number> &solution) const
-  {
-    TimerOutput::Scope t(timer, "compute max speed");
-    Number             max_speed = 0;
-    FEEvaluation<dim, velocity_degree, degree + 1, dim, Number> vel_phi(data,
-                                                                        1,
-                                                                        1);
-
-    for (unsigned int cell = 0; cell < data.n_cell_batches(); ++cell)
-      {
-        // std::cout<< "cell batch: "<< cell <<std::endl;
-        vel_phi.reinit(cell);
-        vel_phi.gather_evaluate(solution, EvaluationFlags::values);
-        VectorizedArray<Number> local_max = 0.;
-        for (unsigned int q = 0; q < vel_phi.n_q_points; ++q)
-          {
-            const auto velocity = vel_phi.get_value(q);
-            local_max           = std::max(local_max, velocity * velocity);
-          }
-
-        for (unsigned int v = 0; v < data.n_active_entries_per_cell_batch(cell);
-             ++v)
-          {
-            max_speed = std::max(max_speed, local_max[v]);
-            // std::cout<< " v: "<<v<< " max speed: "<<max_speed;
-          }
-        // std::cout<<std::endl;
-      }
-
-    max_speed = Utilities::MPI::max(max_speed, MPI_COMM_WORLD);
-
-    return std::sqrt(max_speed);
   }
 
   template <int dim, int degree, int velocity_degree, int n_points_1d>
@@ -787,7 +640,7 @@ namespace LevelsetMatrixfree
 
     {
       TimerOutput::Scope t(timer, "apply - integrals");
-      // LinearAlgebra::distributed::Vector<Number> dst(src);
+
       data.loop(&LevelsetOperator::local_apply_cell,
                 &LevelsetOperator::local_apply_face,
                 &LevelsetOperator::local_apply_boundary_face,
@@ -969,7 +822,7 @@ namespace LevelsetMatrixfree
     output_results(0);
 
     const double max_speed =
-      levelset_operator.compute_maximal_speed(velocity_solution);
+      levelset_operator.compute_cell_convective_speed(velocity_solution);
     pcout << "max speed is" << max_speed << std::endl;
 
     current_time = 0.;
@@ -983,8 +836,6 @@ namespace LevelsetMatrixfree
     std::vector<LinearAlgebra::distributed::Vector<Number> *> ui_and_vel(
       {&rk_register, &velocity_solution});
 
-    const LevelsetTimeIntegrator time_integrator(lsrk_scheme);
-
     const unsigned int total_steps = 2000;
 
     TimeStepping::ExplicitRungeKutta<LinearAlgebra::distributed::Vector<Number>>
@@ -994,8 +845,7 @@ namespace LevelsetMatrixfree
                                                                    const LinearAlgebra::distributed::Vector<Number> &)>
         function_f = [this](const double stage_time,
                             const LinearAlgebra::distributed::Vector<Number> & src) {
-          // std::vector<LinearAlgebra::distributed::Vector<Number> *> src(
-          //     {&y, &velocity_solution});
+
           return levelset_operator.apply(stage_time,
                                          current_time,
                                          old_time_step,
@@ -1004,12 +854,10 @@ namespace LevelsetMatrixfree
                                          src);
         };
 
-    for (int unsigned step = 0; step < 100; ++step)
+    for (int unsigned step = 0; step < total_steps; ++step)
     {
       // compute time step
-      time_step =0.0007;
-          // courant_number /
-          // levelset_operator.compute_cell_convective_speed(velocity_solution);
+      time_step = courant_number /levelset_operator.compute_cell_convective_speed(velocity_solution);
       rk_register = levelset_old_solution;
       {
         TimerOutput::Scope t(timer, "rk time stepping total");
@@ -1017,7 +865,6 @@ namespace LevelsetMatrixfree
         {
           // velocity cannot be extrapolated, so use forward euler (with
           // small tiem step)
-
           levelset_operator.apply_forward_euler(time_step,
                                                 ui_and_vel,
                                                 levelset_solution);
@@ -1031,14 +878,6 @@ namespace LevelsetMatrixfree
             velocity_old_solution *= -1.;
             velocity_old_old_solution *= -1.;
           }
-          // time_integrator.perform_time_step(levelset_operator,
-          //                                   old_time_step,
-          //                                   time_step,
-          //                                   velocity_solution,
-          //                                   velocity_solution,
-          //                                   ui_and_vel,
-          //                                   levelset_old_solution,
-          //                                   levelset_solution);
 #if 0
           const double a_rk[3] = {0.0, 3.0 / 4.0, 1.0 / 3.0};
           const double b_rk[3] = {1.0, 1.0 / 4.0, 2.0 / 3.0};
@@ -1061,17 +900,15 @@ namespace LevelsetMatrixfree
         levelset_old_solution = levelset_solution;
         old_time_step = time_step;
       }
-
-      pcout << "Time:" << std::setw(8) << std::setprecision(10) << current_time
-            << ", dt: " << std::setw(8) << std::setprecision(10) << time_step
-            << " sol l2 norm: " << std::setprecision(10)
-            << std::setw(10) << levelset_solution.l2_norm()
-            << std::endl;
       current_time += time_step;
-
       if ((step + 1) % 100 == 0)
       {
         output_results(step);
+        pcout << "Time:" << std::setw(8) << std::setprecision(10) << current_time
+              << ", dt: " << std::setw(8) << std::setprecision(10) << time_step
+              << " sol l2 norm: " << std::setprecision(10)
+              << std::setw(10) << levelset_solution.l2_norm()
+              << std::endl;
       }
     }
     timer.print_wall_time_statistics(MPI_COMM_WORLD);

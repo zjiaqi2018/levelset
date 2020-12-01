@@ -14,9 +14,7 @@
  * ---------------------------------------------------------------------
 
  *
- * Authors: Martin Kronbichler, Uppsala University,
- *          Wolfgang Bangerth, Texas A&M University,
- *          Timo Heister, University of Goettingen, 2008-2011
+ * Authors: Jiaqi Zhang, 2020
  */
 
 #include <deal.II/base/conditional_ostream.h>
@@ -320,15 +318,6 @@ namespace LevelsetMatrixbase
     void output_results(const unsigned int result_number);
 
     TrilinosWrappers::MPI::Vector
-    evaluate_levelset(
-        const double stage_time,
-        const double step_time,
-        const double old_time_step,
-        const TrilinosWrappers::MPI::Vector &old_velocity,
-        const TrilinosWrappers::MPI::Vector &old_old_velocity,
-        const TrilinosWrappers::MPI::Vector &src);
-
-    TrilinosWrappers::MPI::Vector
     apply(
         const double stage_time,
         const double step_time,
@@ -336,8 +325,6 @@ namespace LevelsetMatrixbase
         const TrilinosWrappers::MPI::Vector &old_velocity,
         const TrilinosWrappers::MPI::Vector &old_old_velocity,
         const TrilinosWrappers::MPI::Vector &src);
-
-    double get_maximal_velocity() const;
 
     double compute_cell_convective_speed(
         const TrilinosWrappers::MPI::Vector &velocity_solution);
@@ -407,7 +394,6 @@ namespace LevelsetMatrixbase
     AffineConstraints<double> velocity_constraints;
 
     double current_time, time, time_step, old_time_step;
-    double global_max_velocity;
     const FEValuesExtractors::Vector velocities;
   };
 
@@ -708,288 +694,6 @@ namespace LevelsetMatrixbase
 
   template <int dim>
   TrilinosWrappers::MPI::Vector
-  LevelsetProblem<dim>::evaluate_levelset(
-      const double stage_time,
-      const double step_time,
-      const double old_time_step,
-      const TrilinosWrappers::MPI::Vector &old_velocity,
-      const TrilinosWrappers::MPI::Vector &old_old_velocity,
-      const TrilinosWrappers::MPI::Vector &src)
-  {
-    TrilinosWrappers::MPI::Vector dst(levelset_solution.locally_owned_elements());
-    TrilinosWrappers::MPI::Vector locally_relevant_src(levelset_old_solution);
-    locally_relevant_src = src;
-    bool extrapolate_velocity = false;
-    //extrapolate velocity
-    if (stage_time - step_time > 1e-12)
-      extrapolate_velocity = true;
-    const double time_step = stage_time - step_time;
-    const double time_step_factor = time_step / old_time_step;
-
-    const auto cell_worker =
-        [&](const Iterator &cell,
-            Assembly::Scratch::LevelsetAssembly<dim> &scratch_data,
-            Assembly::CopyData::LevelsetAssembly<dim> &copy_data) {
-          FEValues<dim> &levelset_fe_values = scratch_data.fe_values;
-          levelset_fe_values.reinit(cell);
-          const unsigned int dofs_per_cell = levelset_fe_values.dofs_per_cell;
-
-          const unsigned int n_q_points = levelset_fe_values.n_quadrature_points;
-          const std::vector<double> &JxW = levelset_fe_values.get_JxW_values();
-
-          std::vector<double> old_ls_sol(n_q_points);
-          levelset_fe_values.get_function_values(locally_relevant_src, old_ls_sol);
-
-          std::vector<Tensor<1, dim>> velocity_values(n_q_points), old_old_velocity_values(n_q_points);
-          typename DoFHandler<dim>::active_cell_iterator velocity_cell(
-              &triangulation, cell->level(), cell->index(), &velocity_dof_handler);
-          FEValues<dim> &velocity_fe_values = scratch_data.fens_values;
-          velocity_fe_values.reinit(velocity_cell);
-          velocity_fe_values[velocities].get_function_values(old_velocity,
-                                                             velocity_values);
-          if (extrapolate_velocity)
-          {
-            velocity_fe_values[velocities].get_function_values(old_old_velocity,
-                                                               old_old_velocity_values);
-            for (unsigned int q = 0; q < n_q_points; ++q)
-              velocity_values[q] = (1. + time_step_factor) * velocity_values[q] - time_step_factor * old_old_velocity_values[q];
-          }
-
-          LAPACKFullMatrix<double> local_matrix(dofs_per_cell, dofs_per_cell);
-          for (unsigned int point = 0; point < n_q_points; ++point)
-          {
-            for (unsigned int i = 0; i < dofs_per_cell; ++i)
-            {
-              for (unsigned int j = 0; j < dofs_per_cell; ++j)
-                local_matrix(i, j) +=
-                    levelset_fe_values.shape_value(i, point) *             // phi_i
-                    levelset_fe_values.shape_value(j, point) * JxW[point]; // phi_j
-
-              copy_data.cell_rhs(i) +=
-                  old_ls_sol[point] * // old_phi
-                  (velocity_values[point] *
-                   levelset_fe_values.shape_grad(i, point)) * // vel grad phi_i
-                  JxW[point];                                 // dx
-            }
-          }
-#if 0
-      std::cout << "cell: " << cell->active_cell_index() << " \n mat: " << std::endl;
-      std::cout << "mesh loop dofs: " << dofs_per_cell << std::endl;
-      {
-        std::cout << "rhs: " << std::endl;
-        for (unsigned int i = 0; i < dofs_per_cell; ++i)
-          std::cout << " " << copy_data.cell_rhs(i) << std::endl;
-        std::cout << std::endl;
-      }
-#endif
-
-          cell->get_dof_indices(copy_data.local_dof_indices);
-          local_matrix.invert();
-          local_matrix.vmult(copy_data.cell_sol, copy_data.cell_rhs);
-          copy_data.is_reinit = false;
-        };
-
-    auto boundary_worker =
-        [&](const Iterator &cell, const unsigned int &face_no,
-            Assembly::Scratch::LevelsetAssembly<dim> &scratch_data,
-            Assembly::CopyData::LevelsetAssembly<dim> &copy_data) {
-          if (!copy_data.is_reinit)
-          {
-            copy_data.cell_rhs = 0.;
-            copy_data.cell_sol = 0.;
-            copy_data.is_reinit = true;
-          }
-          FEFaceValues<dim> &levelset_fe_values = scratch_data.fe_face_values;
-          levelset_fe_values.reinit(cell, face_no);
-
-          const unsigned int n_q_points = levelset_fe_values.n_quadrature_points;
-          const unsigned int dofs_per_cell = levelset_fe_values.dofs_per_cell;
-
-          const std::vector<double> &JxW = levelset_fe_values.get_JxW_values();
-          const std::vector<Tensor<1, dim>> &normals =
-              levelset_fe_values.get_normal_vectors();
-
-          std::vector<double> old_ls_sol(n_q_points);
-          levelset_fe_values.get_function_values(locally_relevant_src, old_ls_sol);
-
-          std::vector<Tensor<1, dim>> velocity_values(n_q_points), old_old_velocity_values(n_q_points);
-          typename DoFHandler<dim>::active_cell_iterator velocity_cell(
-              &triangulation, cell->level(), cell->index(), &velocity_dof_handler);
-          FEFaceValues<dim> &velocity_fe_values = scratch_data.fens_face_values;
-          velocity_fe_values.reinit(velocity_cell, face_no);
-          velocity_fe_values[velocities].get_function_values(old_velocity,
-                                                             velocity_values);
-          if(extrapolate_velocity)                                                             
-          {
-            velocity_fe_values[velocities].get_function_values(old_old_velocity,
-                                                               old_old_velocity_values);
-            for(unsigned int q=0; q< n_q_points; ++q)                                                               
-              velocity_values[q] = (1. + time_step_factor)*velocity_values[q] 
-                                  - time_step_factor* old_old_velocity_values[q];
-          }                                                             
-
-          for (unsigned int point = 0; point < n_q_points; ++point)
-          {
-#if 0
-        std::cout << " vel: " << velocity_values[point] << std::endl
-                  << " old sol: " << old_ls_sol[point] << std::endl;
-#endif
-            const double normal_flux =
-                velocity_values[point] * normals[point]; // vel . n
-            for (unsigned int i = 0; i < dofs_per_cell; ++i)
-            {
-              copy_data.cell_rhs(i) -= // -
-                  normal_flux * old_ls_sol[point] *
-                  levelset_fe_values.shape_value(i, point) * // phi_i
-                  JxW[point];                                // x
-#if 0
-        std::cout << " normal flux: " << normal_flux << std::endl
-                  << " old sol:     " << old_ls_sol[point] << std::endl
-                  << " shape val:   "<< levelset_fe_values.shape_value(i, point)<<std::endl
-                  << " jxw :        " <<JxW[point]<<std::endl;
-#endif
-            }
-          }
-#if 0
-      std::cout << "boundary face: " << face_no << std::endl;
-      {
-        std::cout << "rhs: " << std::endl;
-        for (unsigned int i = 0; i < dofs_per_cell; ++i)
-          std::cout << " " << copy_data.cell_rhs(i) << std::endl;
-        std::cout << std::endl;
-      }
-#endif
-        };
-
-    auto face_worker = [&](const Iterator &cell, const unsigned int &f,
-                           const unsigned int &sf, const Iterator &ncell,
-                           const unsigned int &nf, const unsigned int &nsf,
-                           Assembly::Scratch::LevelsetAssembly<dim> &scratch_data,
-                           Assembly::CopyData::LevelsetAssembly<dim> &copy_data) {
-      if (!copy_data.is_reinit)
-      {
-        copy_data.cell_rhs = 0.;
-        copy_data.cell_sol = 0.;
-        copy_data.is_reinit = true;
-      }
-      FEInterfaceValues<dim> &fe_interface_values =
-          scratch_data.fe_interface_values;
-      fe_interface_values.reinit(cell, f, sf, ncell, nf, nsf);
-
-      const unsigned int n_q_points = fe_interface_values.n_quadrature_points;
-      const std::vector<double> &JxW = fe_interface_values.get_JxW_values();
-      const std::vector<Tensor<1, dim>> &normals =
-          fe_interface_values.get_normal_vectors();
-
-      std::vector<double> jump(n_q_points);
-      get_function_jump(fe_interface_values, locally_relevant_src, jump);
-
-      std::vector<double> average(n_q_points);
-      get_function_average(fe_interface_values, locally_relevant_src, average);
-
-      std::vector<Tensor<1, dim>> velocity_values(n_q_points), old_old_velocity_values(n_q_points);
-      typename DoFHandler<dim>::active_cell_iterator velocity_cell(
-          &triangulation, cell->level(), cell->index(), &velocity_dof_handler);
-      FEFaceValues<dim> &velocity_fe_values = scratch_data.fens_face_values;
-      velocity_fe_values.reinit(velocity_cell, f);
-      velocity_fe_values[velocities].get_function_values(old_velocity, velocity_values);
-
-      if (extrapolate_velocity)
-      {
-        velocity_fe_values[velocities].get_function_values(old_old_velocity,
-                                                           old_old_velocity_values);
-        for (unsigned int q = 0; q < n_q_points; ++q)
-          velocity_values[q] = (1. + time_step_factor) * velocity_values[q] 
-                             - time_step_factor * old_old_velocity_values[q];
-      }
-
-      const unsigned int dofs_per_cell =
-          fe_interface_values.get_fe_face_values(0).dofs_per_cell;
-
-      double lambda = 0;
-      for (unsigned int q = 0; q < n_q_points; ++q)
-         lambda = std::max(lambda, velocity_values[q].norm());
-
-      for (unsigned int point = 0; point < n_q_points; ++point)
-      {
-#if 0
-        std::cout<<" vel: "<< velocity_values[point]<<std::endl
-        <<" jump: "<< jump[point]<<std::endl
-        <<" average: "<< average[point]
-        <<std::endl;
-#endif
-        const double normal_flux = velocity_values[point] * normals[point]; //
-        const double lf_flux =
-            average[point] * normal_flux +           // {old_phi} (vel . n)
-            0.5 * lambda * jump[point]; // + 0.5 lambda [old_phi]
-        for (unsigned int i = 0; i < dofs_per_cell; ++i)
-        {
-          copy_data.cell_rhs(i) -=
-              lf_flux *
-              fe_interface_values.get_fe_face_values(0).shape_value(
-                  i, point) * //    phi_i
-              JxW[point];     //    dx
-#if 0
-        std::cout << " lf flux:   " << lf_flux << std::endl
-                  << " tshape val: "<< fe_interface_values.shape_value(true, i, point)
-                  << " fshape val: "<< fe_interface_values.shape_value(f, i, point)
-                  << " 0shape val: "<<fe_interface_values.get_fe_face_values(0).shape_value(i,point)
-                  <<std::endl
-                  << " jxw :      " <<JxW[point]<<std::endl;
-#endif
-        }
-      }
-#if 0
-      std::cout << "face: " << f <<std::endl;
-      {
-        std::cout << "rhs: " << std::endl;
-        for (unsigned int i = 0; i < dofs_per_cell; ++i)
-          std::cout << " " << copy_data.cell_rhs(i) << std::endl;
-        std::cout << std::endl;
-      }
-#endif
-    };
-
-    auto copier =
-        [&](const Assembly::CopyData::LevelsetAssembly<dim> &copy_data) {
-          const unsigned int dofs_per_cell = copy_data.cell_sol.size();
-          for (unsigned int i = 0; i < dofs_per_cell; ++i)
-          {
-            dst[copy_data.local_dof_indices[i]] = copy_data.cell_sol(i);
-          }
-        };
-
-    QGauss<dim> quadrature_formula(levelset_fe.get_degree() + 2);
-    QGauss<dim - 1> face_quadrature_formula(levelset_fe.get_degree() + 2);
-    const UpdateFlags updateFlagsCell(update_values | update_gradients |
-                                      update_quadrature_points |
-                                      update_JxW_values);
-    const UpdateFlags updateFlagsFace(update_values | update_normal_vectors |
-                                      update_quadrature_points |
-                                      update_JxW_values);
-    
-    const UpdateFlags updateFlagsNS(update_values);
-
-    Assembly::CopyData::LevelsetAssembly<dim> copy_data(levelset_fe);
-    Assembly::Scratch::LevelsetAssembly<dim> scratch_data(
-        levelset_fe, quadrature_formula, updateFlagsCell, face_quadrature_formula,
-        updateFlagsFace, velocity_fe, updateFlagsNS);
-
-    MeshWorker::mesh_loop(
-        levelset_dof_handler.begin_active(), levelset_dof_handler.end(),
-        cell_worker, copier, scratch_data, copy_data,
-        MeshWorker::assemble_own_cells | MeshWorker::assemble_boundary_faces |
-            MeshWorker::assemble_ghost_faces_both |
-            MeshWorker::assemble_own_interior_faces_both |
-            MeshWorker::cells_after_faces,
-        boundary_worker, face_worker);
-
-    return dst;        
-  }
-
-
-  template <int dim>
-  TrilinosWrappers::MPI::Vector
   LevelsetProblem<dim>::apply(
       const double stage_time,
       const double step_time,
@@ -1158,16 +862,6 @@ namespace LevelsetMatrixbase
                   JxW[point];                                 // dx
             }
           }
-#if 0
-      std::cout << "cell: " << cell->active_cell_index() << " \n mat: " << std::endl;
-      std::cout << "mesh loop dofs: " << dofs_per_cell << std::endl;
-      {
-        std::cout << "rhs: " << std::endl;
-        for (unsigned int i = 0; i < dofs_per_cell; ++i)
-          std::cout << " " << copy_data.cell_rhs(i) << std::endl;
-        std::cout << std::endl;
-      }
-#endif
 
           cell->get_dof_indices(copy_data.local_dof_indices);
           local_matrix.invert();
@@ -1208,10 +902,6 @@ namespace LevelsetMatrixbase
 
           for (unsigned int point = 0; point < n_q_points; ++point)
           {
-#if 0
-        std::cout << " vel: " << velocity_values[point] << std::endl
-                  << " old sol: " << old_ls_sol[point] << std::endl;
-#endif
             const double normal_flux =
                 velocity_values[point] * normals[point]; // vel . n
             for (unsigned int i = 0; i < dofs_per_cell; ++i)
@@ -1220,23 +910,8 @@ namespace LevelsetMatrixbase
                   normal_flux * old_ls_sol[point] *
                   levelset_fe_values.shape_value(i, point) * // phi_i
                   JxW[point];                                // dx
-#if 0
-        std::cout << " normal flux: " << normal_flux << std::endl
-                  << " old sol:     " << old_ls_sol[point] << std::endl
-                  << " shape val:   "<< levelset_fe_values.shape_value(i, point)<<std::endl
-                  << " jxw :        " <<JxW[point]<<std::endl;
-#endif
             }
           }
-#if 0
-      std::cout << "boundary face: " << face_no << std::endl;
-      {
-        std::cout << "rhs: " << std::endl;
-        for (unsigned int i = 0; i < dofs_per_cell; ++i)
-          std::cout << " " << copy_data.cell_rhs(i) << std::endl;
-        std::cout << std::endl;
-      }
-#endif
         };
 
     auto face_worker = [&](const Iterator &cell, const unsigned int &f,
@@ -1281,12 +956,6 @@ namespace LevelsetMatrixbase
 
       for (unsigned int point = 0; point < n_q_points; ++point)
       {
-#if 0
-        std::cout<<" vel: "<< velocity_values[point]<<std::endl
-        <<" jump: "<< jump[point]<<std::endl
-        <<" average: "<< average[point]
-        <<std::endl;
-#endif
         const double normal_flux = velocity_values[point] * normals[point]; //
         const double lf_flux =
             average[point] * normal_flux +           // {old_phi} (vel . n)
@@ -1298,25 +967,8 @@ namespace LevelsetMatrixbase
               fe_interface_values.get_fe_face_values(0).shape_value(
                   i, point) * //    phi_i
               JxW[point];     //    dx
-#if 0
-        std::cout << " lf flux:   " << lf_flux << std::endl
-                  << " tshape val: "<< fe_interface_values.shape_value(true, i, point)
-                  << " fshape val: "<< fe_interface_values.shape_value(f, i, point)
-                  << " 0shape val: "<<fe_interface_values.get_fe_face_values(0).shape_value(i,point)
-                  <<std::endl
-                  << " jxw :      " <<JxW[point]<<std::endl;
-#endif
         }
       }
-#if 0
-      std::cout << "face: " << f <<std::endl;
-      {
-        std::cout << "rhs: " << std::endl;
-        for (unsigned int i = 0; i < dofs_per_cell; ++i)
-          std::cout << " " << copy_data.cell_rhs(i) << std::endl;
-        std::cout << std::endl;
-      }
-#endif
     };
 
     auto copier =
@@ -1356,38 +1008,10 @@ namespace LevelsetMatrixbase
   }
 
   template <int dim>
-  double LevelsetProblem<dim>::get_maximal_velocity() const
-  {
-    const QIterated<dim> quadrature_formula(QTrapez<1>(),
-                                            levelset_fe.get_degree() + 2);
-    const unsigned int n_q_points = quadrature_formula.size();
-
-    FEValues<dim> fe_values(mapping, velocity_fe, quadrature_formula,
-                            update_values);
-    std::vector<Tensor<1, dim>> velocity_values(n_q_points);
-
-    double max_local_velocity = 0;
-    const FEValuesExtractors::Vector velocities(0);
-    for (const auto &cell : velocity_dof_handler.active_cell_iterators())
-      if (cell->is_locally_owned())
-      {
-        fe_values.reinit(cell);
-        fe_values[velocities].get_function_values(velocity_solution,
-                                                  velocity_values);
-
-        for (unsigned int q = 0; q < n_q_points; ++q)
-          max_local_velocity =
-              std::max(max_local_velocity, velocity_values[q].norm());
-      }
-
-    return Utilities::MPI::max(max_local_velocity, MPI_COMM_WORLD);
-  }
-
-  template <int dim>
   double LevelsetProblem<dim>::
   compute_cell_convective_speed(const TrilinosWrappers::MPI::Vector &velocity_solution)
   {
-    const QGauss<dim> quadrature_formula(fe_degree + 1);
+    const QGauss<dim> quadrature_formula(fe_degree + 2);
     const unsigned int n_q_points = quadrature_formula.size();
 
     FEValues<dim> fe_values(mapping, velocity_fe, quadrature_formula,
@@ -1422,7 +1046,6 @@ namespace LevelsetMatrixbase
   template <int dim>
   void LevelsetProblem<dim>::run_levelset()
   {
-    std::cout << "run levelset" << std::endl;
     make_grid_and_dofs();
     {
       //levelset initial condition
@@ -1448,11 +1071,11 @@ namespace LevelsetMatrixbase
     TrilinosWrappers::MPI::Vector rk_register;
     rk_register.reinit(levelset_old_solution);
 
+    const unsigned int total_steps = 2000;
     time_step = 0.0001;
     old_time_step = time_step;
     current_time = 0.;
-    global_max_velocity = get_maximal_velocity();
-    pcout << " max vel = " << global_max_velocity << std::endl;
+    pcout << " max convective speed = " << compute_cell_convective_speed(velocity_solution) << std::endl;
 
     TimeStepping::ExplicitRungeKutta<TrilinosWrappers::MPI::Vector>
         ssprk3(TimeStepping::SSP_THIRD_ORDER);
@@ -1461,70 +1084,65 @@ namespace LevelsetMatrixbase
         function_f = [this](const double stage_time,
                             const TrilinosWrappers::MPI::Vector &src) {
           return this->apply(stage_time,
-                                         current_time,
-                                         old_time_step,
-                                         velocity_old_solution,
-                                         velocity_old_old_solution,
-                                         src);
+                             current_time,
+                             old_time_step,
+                             velocity_old_solution,
+                             velocity_old_old_solution,
+                             src);
         };
 
-    for (int step = 0; step < 100; ++step)
+    for (unsigned int step = 0; step < total_steps; ++step)
     {
-      time_step = 0.0007;//courant_number / compute_cell_convective_speed(velocity_solution);
-
-      if (step < 1)
-        perform_forwar_euler(time_step,
-                             levelset_solution,
-                             levelset_old_solution,
-                             velocity_solution);
-      else
+      time_step = courant_number / compute_cell_convective_speed(velocity_solution);
       {
-
         TimerOutput::Scope t(timer, "rk time stepping total");
-#if 0
-        const double a_rk[3] = {0.0, 3.0 / 4.0, 1.0 / 3.0};
-        const double b_rk[3] = {1.0, 1.0 / 4.0, 2.0 / 3.0};
-        rk_register = levelset_old_solution;
-        for (unsigned int i = 0; i < 3; ++i)
-        {
+        if (step < 1)
           perform_forwar_euler(time_step,
                                levelset_solution,
-                               rk_register,
+                               levelset_old_solution,
                                velocity_solution);
-          levelset_solution.sadd(b_rk[i], a_rk[i], levelset_old_solution);
-          rk_register = levelset_solution;
-        }
+        else
+        {
+          if (step == total_steps / 2)
+          {
+            velocity_solution *= -1.;
+            velocity_old_solution *= -1.;
+            velocity_old_old_solution *= -1.;
+          }
+#if 0
+          const double a_rk[3] = {0.0, 3.0 / 4.0, 1.0 / 3.0};
+          const double b_rk[3] = {1.0, 1.0 / 4.0, 2.0 / 3.0};
+          rk_register = levelset_old_solution;
+          for (unsigned int i = 0; i < 3; ++i)
+          {
+            perform_forwar_euler(time_step,
+                                 levelset_solution,
+                                 rk_register,
+                                 velocity_solution);
+            levelset_solution.sadd(b_rk[i], a_rk[i], levelset_old_solution);
+            rk_register = levelset_solution;
+          }
 
-#else        
-        ssprk3.evolve_one_time_step(function_f,
-        current_time,
-        time_step,
-        levelset_solution);
+#else
+          ssprk3.evolve_one_time_step(function_f,
+                                      current_time,
+                                      time_step,
+                                      levelset_solution);
 #endif
+        }
       }
       levelset_old_solution = levelset_solution;
       old_time_step = time_step;
-
-      pcout << "Time:" << std::setw(8) << std::setprecision(10) << current_time
-            << ", dt: " << std::setw(8) << std::setprecision(10) << time_step
-            << " sol l2 norm: " << std::setprecision(10)
-            << std::setw(10) << levelset_solution.l2_norm()
-            << std::endl;
-
       current_time += time_step;
-
-
-      if (step == 499)
-      {
-        velocity_solution *= -1.;
-        velocity_old_solution *= -1.;
-        velocity_old_old_solution *= -1.;
-      }
   
       if ((step + 1) % 100 == 0)
       {
         output_results(step);
-
+        pcout << "Time:" << std::setw(8) << std::setprecision(10) << current_time
+              << ", dt: " << std::setw(8) << std::setprecision(10) << time_step
+              << " sol l2 norm: " << std::setprecision(10)
+              << std::setw(10) << levelset_solution.l2_norm()
+              << std::endl;
       }
 
     }
