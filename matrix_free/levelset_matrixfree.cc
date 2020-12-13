@@ -678,6 +678,8 @@ namespace LevelsetMatrixfree
 
     void output_results(const unsigned int result_number);
 
+    void compute_errors() const;
+
     LinearAlgebra::distributed::Vector<Number> levelset_solution;
     LinearAlgebra::distributed::Vector<Number> levelset_old_solution;
 
@@ -785,6 +787,22 @@ namespace LevelsetMatrixfree
 
     data_out.write_vtu_with_pvtu_record(
       "./", "levelset_solution", result_number, MPI_COMM_WORLD, 2, 8);
+  }
+
+  template <int dim>
+  void LevelsetProblem<dim>::compute_errors() const
+  {
+    Vector<float> error_per_cell(triangulation.n_active_cells());
+    VectorTools::integrate_difference(levelset_dof_handler,
+                                      levelset_solution,
+                                      LevelsetInitialValues<dim>(),
+                                      error_per_cell,
+                                      QGauss<dim>(levelset_fe.degree + 2),
+                                      VectorTools::L2_norm);
+    pcout << "Verification via L2 error:    "
+          << std::sqrt(
+                 Utilities::MPI::sum(error_per_cell.norm_sqr(), MPI_COMM_WORLD))
+          << std::endl;
   }
 
   template <int dim>
@@ -911,6 +929,7 @@ namespace LevelsetMatrixfree
               << std::endl;
       }
     }
+    compute_errors();
     timer.print_wall_time_statistics(MPI_COMM_WORLD);
     pcout << std::endl;
   }
