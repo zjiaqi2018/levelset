@@ -1,0 +1,9 @@
+.vscode
+CMakeFiles
+*vtu
+*txt
+*.out
+*.sh
+cmake*
+levelset_matrixfree
+Makefile

@@ -15,6 +15,7 @@
 
  *
  * Author: Jiaqi Zhang, 2020
+ * Based on dealii tutorial step-67
  */
 
 #include <deal.II/base/conditional_ostream.h>
@@ -57,7 +58,7 @@ namespace LevelsetMatrixfree
 {
   using namespace dealii;
 
-  constexpr unsigned int dimension            = 2;
+  constexpr unsigned int dimension            = 3;
   constexpr unsigned int n_global_refinements = 6;
   constexpr unsigned int fe_degree            = 3;
   constexpr unsigned int vel_degree           = 2;
@@ -621,23 +622,27 @@ namespace LevelsetMatrixfree
           const LinearAlgebra::distributed::Vector<Number> &old_old_velocity,
           const LinearAlgebra::distributed::Vector<Number> &src) const
   {
+    TimerOutput::Scope t(timer, "apply function");
     LinearAlgebra::distributed::Vector<Number> dst(src);
     LinearAlgebra::distributed::Vector<Number> tmp_src(src);
     tmp_src = src;
     LinearAlgebra::distributed::Vector<Number> advect_velocity(old_velocity);
     advect_velocity = old_velocity;
-    //extrapolate velocity if stage_time > step_time
-    if (stage_time - step_time > 1e-12)
-    {
-      const double time_step = stage_time - step_time;
-      const double time_step_factor = time_step / old_time_step;
-      advect_velocity *= (1. + time_step_factor);
-      // advect_velocity.equ(1. + time_step_factor, old_velocity);
-      advect_velocity.add(-time_step_factor, old_old_velocity);
+    {  
+      //extrapolate velocity if stage_time > step_time
+      TimerOutput::Scope t(timer, "extrapolate velocity");
+      if (stage_time - step_time > 1e-12)
+	{
+	  const double time_step = stage_time - step_time;
+	  const double time_step_factor = time_step / old_time_step;
+	  advect_velocity *= (1. + time_step_factor);
+	  // advect_velocity.equ(1. + time_step_factor, old_velocity);
+	  advect_velocity.add(-time_step_factor, old_old_velocity);
+	}
     }
     const std::vector<LinearAlgebra::distributed::Vector<Number> *> src_and_vel(
-      {&tmp_src, &advect_velocity});
-
+										{&tmp_src, &advect_velocity});    
+    
     {
       TimerOutput::Scope t(timer, "apply - integrals");
 
@@ -709,6 +714,8 @@ namespace LevelsetMatrixfree
 
     IndexSet                  velocity_locally_relevant_dofs;
     AffineConstraints<double> velocity_constraints;
+    const double a_rk[3] = {0.0, 3.0 / 4.0, 1.0 / 3.0};
+    const double b_rk[3] = {1.0, 1.0 / 4.0, 2.0 / 3.0};
   };
 
 
@@ -841,7 +848,7 @@ namespace LevelsetMatrixfree
 
     const double max_speed =
       levelset_operator.compute_cell_convective_speed(velocity_solution);
-    pcout << "max speed is" << max_speed << std::endl;
+    pcout << "max speed is " << max_speed << std::endl;
 
     current_time = 0.;
 
@@ -896,16 +903,20 @@ namespace LevelsetMatrixfree
             velocity_old_solution *= -1.;
             velocity_old_old_solution *= -1.;
           }
-#if 0
-          const double a_rk[3] = {0.0, 3.0 / 4.0, 1.0 / 3.0};
-          const double b_rk[3] = {1.0, 1.0 / 4.0, 2.0 / 3.0};
+#if 1
           for (unsigned int i = 0; i < 3; ++i)
           {
-            levelset_operator.apply_forward_euler(time_step,
-                                                  ui_and_vel,
-                                                  levelset_solution);
-            levelset_solution.sadd(b_rk[i], a_rk[i], levelset_old_solution);
-            rk_register = levelset_solution;
+            {
+              TimerOutput::Scope t(timer, "apply forward euler");
+              levelset_operator.apply_forward_euler(time_step,
+                                                    ui_and_vel,
+                                                    levelset_solution);
+            }
+            {
+              TimerOutput::Scope t(timer, "rk stages vector operations");
+              levelset_solution.sadd(b_rk[i], a_rk[i], levelset_old_solution);
+              rk_register = levelset_solution;
+            }
           }
 #else
           ssprk3.evolve_one_time_step(function_f,
@@ -919,7 +930,7 @@ namespace LevelsetMatrixfree
         old_time_step = time_step;
       }
       current_time += time_step;
-      if ((step + 1) % 100 == 0)
+      if ((step + 1) % 500 == 0)
       {
         output_results(step);
         pcout << "Time:" << std::setw(8) << std::setprecision(10) << current_time
