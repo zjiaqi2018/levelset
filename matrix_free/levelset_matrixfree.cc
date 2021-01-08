@@ -41,6 +41,7 @@
 
 #include <deal.II/lac/affine_constraints.h>
 #include <deal.II/lac/la_parallel_vector.h>
+#include <deal.II/lac/block_vector.h>
 
 #include <deal.II/matrix_free/fe_evaluation.h>
 #include <deal.II/matrix_free/matrix_free.h>
@@ -110,6 +111,50 @@ namespace LevelsetMatrixfree
   }
 
   template <int dim>
+  class StokesLevelsetVelocity : public Function<dim>
+  {
+  public:
+    StokesLevelsetVelocity()
+      : Function<dim>(dim+4*dim)
+    {}
+    virtual double value(const Point<dim> & point,
+                         const unsigned int component = 0) const override;
+  };
+
+  template <int dim>
+  double StokesLevelsetVelocity<dim>::value(const Point<dim> & point,
+                                      const unsigned int component) const
+  {
+    Assert(dim >= 2, ExcNotImplemented());
+    const double pi = numbers::PI;
+    const double x  = point[0];
+    const double y  = point[1];
+
+    if (dim == 2)
+      {
+        if (component == 0)
+          return -std::sin(2. * pi * y) * std::sin(pi * x) * std::sin(pi * x);
+        else if(component == 1)
+          return std::sin(2. * pi * x) * std::sin(pi * y) * std::sin(pi * y);
+        else return 0.;  
+      }
+    else /*(dim == 3)*/
+      {
+        const double z = point[2];
+        if (component == 0)
+          return 2. * std::sin(pi * x) * std::sin(pi * x) *
+                 std::sin(2. * pi * y) * std::sin(2. * pi * z);
+        else if (component == 1)
+          return -std::sin(2. * pi * x) * std::sin(pi * y) * std::sin(pi * y) *
+                 std::sin(2. * pi * z);
+        else if (component == 2)
+          return -std::sin(2. * pi * x) * std::sin(2. * pi * y) *
+                 std::sin(pi * z);
+        else return 0.;                 
+      }
+  }
+
+  template <int dim>
   class LevelsetInitialValues : public Function<dim>
   {
   public:
@@ -162,7 +207,6 @@ namespace LevelsetMatrixfree
   {
     return 0.5 * (u_m + u_p) * (velocity * normal) + 0.5 * lambda * (u_m - u_p);
   }
-
 
   template <int dim, typename Number>
   VectorizedArray<Number>
@@ -374,7 +418,9 @@ namespace LevelsetMatrixfree
     // 	)
     FEEvaluation<dim, degree, n_points_1d, 1, Number>            phi(data, 0);
     FEEvaluation<dim, velocity_degree, n_points_1d, dim, Number> vel_phi(data,
-                                                                         1);
+                                                                         1,
+                                                                         0,
+                                                                         0);
 
     for (unsigned int cell = cell_range.first; cell < cell_range.second; ++cell)
       {
@@ -413,7 +459,7 @@ namespace LevelsetMatrixfree
     FEFaceEvaluation<dim, degree, n_points_1d, 1, Number> phi_m(data, true, 0);
     FEFaceEvaluation<dim, degree, n_points_1d, 1, Number> phi_p(data, false, 0);
     FEFaceEvaluation<dim, velocity_degree, n_points_1d, dim, Number> vel_phi(
-      data, true, 1);
+      data, true, 1, 0, 0);
 
     for (unsigned int face = face_range.first; face < face_range.second; ++face)
       {
@@ -460,7 +506,7 @@ namespace LevelsetMatrixfree
   {
     FEFaceEvaluation<dim, degree, n_points_1d, 1, Number> phi(data, true, 0);
     FEFaceEvaluation<dim, velocity_degree, n_points_1d, dim, Number> vel_phi(
-      data, true, 1);
+      data, true, 1, 0, 0);
 
     for (unsigned int face = face_range.first; face < face_range.second; ++face)
       {
@@ -677,9 +723,12 @@ namespace LevelsetMatrixfree
     LevelsetProblem();
 
     void run();
+    void run_test();
 
   private:
     void make_grid_and_dofs();
+
+    void setup_stokes_dofs();
 
     void output_results(const unsigned int result_number);
 
@@ -691,6 +740,9 @@ namespace LevelsetMatrixfree
     LinearAlgebra::distributed::Vector<Number> velocity_solution,
       velocity_old_solution, velocity_old_old_solution;
 
+    LinearAlgebra::distributed::Vector<Number> stokes_solution,
+      stokes_old_solution, stokes_old_old_solution;
+
     ConditionalOStream pcout;
 
 #ifdef DEAL_II_WITH_P4EST
@@ -701,19 +753,21 @@ namespace LevelsetMatrixfree
 
     FE_DGQ<dim>          levelset_fe;
     FESystem<dim>        velocity_fe;
+    FESystem<dim>        stokes_fe;
     MappingQGeneric<dim> mapping;
     DoFHandler<dim>      levelset_dof_handler;
     DoFHandler<dim>      velocity_dof_handler;
+    DoFHandler<dim>      stokes_dof_handler;
 
     TimerOutput timer;
 
     LevelsetOperator<dim, fe_degree, vel_degree, n_q_points_1d>
-      levelset_operator;
+      levelset_operator, levelset_operator_stokes;
 
     double current_time, time_step, old_time_step;
 
-    IndexSet                  velocity_locally_relevant_dofs;
-    AffineConstraints<double> velocity_constraints;
+    IndexSet                  velocity_locally_relevant_dofs, stokes_locally_relevant_dofs;
+    AffineConstraints<double> velocity_constraints, stokes_constraints;
     const double a_rk[3] = {0.0, 3.0 / 4.0, 1.0 / 3.0};
     const double b_rk[3] = {1.0, 1.0 / 4.0, 2.0 / 3.0};
   };
@@ -727,11 +781,14 @@ namespace LevelsetMatrixfree
 #endif
     , levelset_fe(fe_degree)
     , velocity_fe(FE_Q<dim>(vel_degree), dim)
+    , stokes_fe(FE_Q<dim>(vel_degree), dim, FE_Q<dim>(vel_degree - 1), 4*dim)
     , mapping(fe_degree)
     , levelset_dof_handler(triangulation)
     , velocity_dof_handler(triangulation)
+    , stokes_dof_handler(triangulation)
     , timer(pcout, TimerOutput::never, TimerOutput::wall_times)
     , levelset_operator(timer)
+    , levelset_operator_stokes(timer)
     , current_time(0)
   {}
 
@@ -781,6 +838,38 @@ namespace LevelsetMatrixfree
 
 
   template <int dim>
+  void LevelsetProblem<dim>::setup_stokes_dofs()
+  {
+    // std::vector<unsigned int> stokes_sub_blocks(dim + 1, 0);
+    // stokes_sub_blocks[dim] = 1;
+    stokes_dof_handler.distribute_dofs(stokes_fe);
+    // DoFRenumbering::component_wise(stokes_dof_handler, stokes_sub_blocks);
+
+    DoFTools::extract_locally_relevant_dofs(stokes_dof_handler,
+                                            stokes_locally_relevant_dofs);
+    stokes_constraints.clear();
+    stokes_constraints.reinit(stokes_locally_relevant_dofs);
+    DoFTools::make_hanging_node_constraints(stokes_dof_handler,
+                                            stokes_constraints);
+    stokes_constraints.close();
+
+    const std::vector<const DoFHandler<dim> *> dof_handlers = {
+      &levelset_dof_handler, &stokes_dof_handler};
+    const AffineConstraints<double>                      dummy;
+    const std::vector<const AffineConstraints<double> *> constraints = {
+      &dummy, &stokes_constraints};
+    const std::vector<Quadrature<1>> quadratures = {QGauss<1>(n_q_points_1d),
+                                                    QGauss<1>(fe_degree + 1)};
+
+    levelset_operator_stokes.reinit(mapping, dof_handlers, constraints, quadratures);
+
+    levelset_operator_stokes.initialize_vector(stokes_solution, 1);
+    stokes_old_solution.reinit(stokes_solution);
+    stokes_old_old_solution.reinit(stokes_solution);
+  }
+
+
+  template <int dim>
   void LevelsetProblem<dim>::output_results(const unsigned int result_number)
   {
     DataOut<dim> data_out;
@@ -812,6 +901,109 @@ namespace LevelsetMatrixfree
           << std::endl;
   }
 
+
+
+  template <int dim>
+  void LevelsetProblem<dim>::run_test()
+  {
+    {
+      const unsigned int n_vect_number = VectorizedArray<Number>::size();
+      const unsigned int n_vect_bits   = 8 * sizeof(Number) * n_vect_number;
+
+      pcout << "Running with "
+            << Utilities::MPI::n_mpi_processes(MPI_COMM_WORLD)
+            << " MPI processes" << std::endl;
+      pcout << "Vectorization over " << n_vect_number << " "
+            << (std::is_same<Number, double>::value ? "doubles" : "floats")
+            << " = " << n_vect_bits << " bits ("
+            << Utilities::System::get_current_vectorization_level() << ")"
+            << std::endl;
+    }
+    make_grid_and_dofs();
+    setup_stokes_dofs();
+    VectorTools::interpolate(levelset_dof_handler,
+                             LevelsetInitialValues<dim>(),
+                             levelset_solution);
+    levelset_old_solution = levelset_solution;
+
+    VectorTools::interpolate(velocity_dof_handler,
+                             LevelsetVelocity<dim>(),
+                             velocity_solution);
+    velocity_solution.update_ghost_values();                             
+    velocity_old_old_solution = velocity_solution;
+    velocity_old_solution     = velocity_solution;
+
+    {
+      ComponentMask vel_component_mask(dim + 4*dim, false);
+      for(unsigned int d=0; d<dim; ++d)
+        vel_component_mask.set(d, true);
+
+      VectorTools::interpolate(stokes_dof_handler,
+                               StokesLevelsetVelocity<dim>(),
+                               stokes_solution, vel_component_mask);
+      stokes_solution.update_ghost_values();
+      
+      stokes_old_solution = stokes_solution;
+      stokes_old_old_solution = stokes_solution;
+    }
+
+    output_results(0);
+
+    const double max_speed =
+      levelset_operator.compute_cell_convective_speed(velocity_solution);
+    pcout << "max speed is " << max_speed << std::endl;
+
+    current_time = 0.;
+
+    LinearAlgebra::distributed::Vector<Number> rk_register, rk_register_stokes;
+    rk_register.reinit(levelset_solution);
+    rk_register_stokes.reinit(levelset_solution);
+    rk_register = levelset_solution;
+    rk_register_stokes = levelset_solution;
+
+    std::vector<LinearAlgebra::distributed::Vector<Number> *> ui_and_vel(
+      {&rk_register, &velocity_solution});
+
+    std::vector<LinearAlgebra::distributed::Vector<Number> *> ui_and_stokes(
+      {&rk_register_stokes, &stokes_solution});
+
+    const unsigned int total_steps = 2000;
+
+    time_step = 1e-4;
+    for (int unsigned step = 0; step < total_steps; ++step)
+    {
+      //run 2000 steps of forward euler for testing 
+      {
+        TimerOutput::Scope t(timer, "velocity dof");
+        levelset_operator.apply_forward_euler(time_step,
+                                              ui_and_vel,
+                                              levelset_solution);
+
+      }
+      {
+        TimerOutput::Scope t(timer, "stokes dof");
+        levelset_operator_stokes.apply_forward_euler(time_step,
+                                                     ui_and_stokes,
+                                                     levelset_old_solution);
+      }
+      rk_register = levelset_solution;
+      rk_register_stokes = levelset_old_solution;
+      if (step % 500 == 0)
+      {
+        pcout << " vel dof l2 norm: " << levelset_solution.l2_norm()
+              << " inf: " << levelset_solution.linfty_norm()
+              << std::endl;
+        pcout << " stokes dof l2 norm: " << levelset_old_solution.l2_norm()
+              << " inf: " << levelset_old_solution.linfty_norm()
+              << std::endl;
+      }
+    }
+
+    timer.print_wall_time_statistics(MPI_COMM_WORLD);
+    pcout << std::endl;
+  }
+
+
   template <int dim>
   void LevelsetProblem<dim>::run()
   {
@@ -829,6 +1021,7 @@ namespace LevelsetMatrixfree
             << std::endl;
     }
     make_grid_and_dofs();
+    setup_stokes_dofs();
     VectorTools::interpolate(levelset_dof_handler,
                              LevelsetInitialValues<dim>(),
                              levelset_solution);
@@ -841,9 +1034,6 @@ namespace LevelsetMatrixfree
     velocity_old_old_solution = velocity_solution;
     velocity_old_solution     = velocity_solution;
 
-    std::vector<LinearAlgebra::distributed::Vector<double> *>
-      levelset_src_vectors({&levelset_old_solution, &velocity_solution});
-
     output_results(0);
 
     const double max_speed =
@@ -851,9 +1041,6 @@ namespace LevelsetMatrixfree
     pcout << "max speed is " << max_speed << std::endl;
 
     current_time = 0.;
-
-    std::vector<LinearAlgebra::distributed::Vector<Number> *> old_sol_and_vel(
-      {&levelset_old_solution, &velocity_solution});
 
     LinearAlgebra::distributed::Vector<Number> rk_register;
     rk_register.reinit(levelset_solution);
@@ -908,13 +1095,19 @@ namespace LevelsetMatrixfree
           {
             {
               TimerOutput::Scope t(timer, "apply forward euler");
-              levelset_operator.apply_forward_euler(time_step,
-                                                    ui_and_vel,
-                                                    levelset_solution);
+              // levelset_operator.apply_forward_euler(time_step,
+              //                                       ui_and_vel,
+              //                                       levelset_solution);
+              levelset_operator.perform_stage(time_step,
+                                              b_rk[i],
+                                              a_rk[i],
+                                              levelset_old_solution,
+                                              ui_and_vel,
+                                              levelset_solution);
             }
             {
               TimerOutput::Scope t(timer, "rk stages vector operations");
-              levelset_solution.sadd(b_rk[i], a_rk[i], levelset_old_solution);
+              // levelset_solution.sadd(b_rk[i], a_rk[i], levelset_old_solution);
               rk_register = levelset_solution;
             }
           }
@@ -958,7 +1151,7 @@ int main(int argc, char **argv)
     {
       deallog.depth_console(0);
       LevelsetProblem<dimension> ls_problem;
-      ls_problem.run();
+      ls_problem.run_test();
     }
   catch (std::exception &exc)
     {

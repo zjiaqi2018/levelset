@@ -1,0 +1,6 @@
+matrix_free/run_script.sh~
+matrix_free/build/.ninja_deps
+matrix_free/build/.ninja_log
+matrix_free/build/build.ninja
+matrix_free/build/compile_commands.json
+matrix_free/build/rules.ninja
